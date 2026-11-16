@@ -2,35 +2,43 @@ import os
 import re
 import sqlite3
 import hashlib
+import hmac
+import secrets
+import logging
 from contextlib import closing
 
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template_string, session, abort
 from cryptography.fernet import Fernet
 
 app = Flask(__name__)
+app.config.update(MAX_CONTENT_LENGTH=4096, SESSION_COOKIE_HTTPONLY=True,
+                  SESSION_COOKIE_SAMESITE='Strict', SESSION_COOKIE_SECURE=True,
+                  PERMANENT_SESSION_LIFETIME=1800)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+
+def read_secret(name):
+    path = os.getenv(name + '_FILE')
+    value = open(path, encoding='ascii').read().strip() if path else os.getenv(name)
+    if not value:
+        raise RuntimeError(f'{name} is not configured')
+    return value
 
 # Get encryption key from environment variable
-encryption_key = os.getenv('ENCRYPTION_KEY')
-if not encryption_key:
-    raise Exception("ENCRYPTION_KEY is not set")
-
+encryption_key = read_secret('ENCRYPTION_KEY')
 cipher = Fernet(encryption_key.encode())
+app.secret_key = read_secret('FLASK_SECRET')
 
 # Database file path
-DB_FILE = '/usr/src/app/db/keys.db'
+DB_FILE = os.getenv('DB_FILE', '/usr/src/app/db/keys.db')
+MAX_STORED_TOKENS = 1000
 
 # Function to initialize the database if it doesn't exist
 def initialize_db():
-    print(f"Initializing database at: {DB_FILE}", flush=True)
     if os.path.exists(DB_FILE) and not os.path.isfile(DB_FILE):
-        print(f"Error: {DB_FILE} exists but is not a file and cannot be removed automatically.", flush=True)
-        print("Please remove it manually and restart the application.", flush=True)
-        return
-
-    if not os.path.exists(DB_FILE):
-        print(f"Database file does not exist. Creating a new one at: {DB_FILE}", flush=True)
+        raise RuntimeError("database path is not a file")
     try:
-        conn = sqlite3.connect(DB_FILE)
+        os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
+        conn = sqlite3.connect(DB_FILE, timeout=5)
         conn.execute('''
         CREATE TABLE IF NOT EXISTS keys (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -38,11 +46,21 @@ def initialize_db():
             key_hash TEXT NOT NULL
         )
         ''')
+        conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_keys_hash_unique ON keys(key_hash)')
         conn.commit()
         conn.close()
-        print("Database initialized successfully.", flush=True)
-    except Exception as e:
-        print(f"Error initializing database: {e}", flush=True)
+    except sqlite3.Error as exc:
+        logging.error('database initialization failed (%s)', type(exc).__name__)
+        raise
+
+initialize_db()
+
+@app.before_request
+def request_guards():
+    if request.method == 'POST' and request.path != '/api/key-status' and 'application/json' not in request.headers.get('Accept', ''):
+        token = session.get('csrf_token', '')
+        if not token or not hmac.compare_digest(token, request.form.get('csrf_token', '')):
+            abort(400, description='invalid request token')
 
 # HTML template for the landing page
 HTML_TEMPLATE = """
@@ -140,6 +158,7 @@ HTML_TEMPLATE = """
     <div class="container">
         <h1>WebOS Token Refresher</h1>
         <form action="/" method="post">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
             <input type="text" name="key" placeholder="Enter your token" required>
             <button type="submit" name="action" value="add">Add Token</button>
             <button type="submit" name="action" value="remove" class="remove">Remove Token</button>
@@ -185,84 +204,106 @@ def key_status():
     response.headers['Cache-Control'] = 'no-store'
     return response
 
+@app.after_request
+def security_headers(response):
+    response.headers['Cache-Control'] = 'no-store'
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['Referrer-Policy'] = 'no-referrer'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['Content-Security-Policy'] = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+    return response
+
 
 # Landing page route
 @app.route('/', methods=['GET', 'POST'])
 def manage_key():
     message = None
-    is_api_request = request.headers.get('Accept') == 'application/json'
+    is_api_request = 'application/json' in request.headers.get('Accept', '')
 
     if request.method == 'POST':
         key = request.form.get('key')
         action = request.form.get('action')
 
+        if action not in ('add', 'remove'):
+            return (jsonify({'error': 'invalid action'}), 400) if is_api_request else (render_template_string(HTML_TEMPLATE, message='invalid action', csrf_token=session.get('csrf_token', '')), 400)
+
         if not key:
             if is_api_request:
                 return jsonify({'error': 'token is required'}), 400
             message = "token is required"
-            return render_template_string(HTML_TEMPLATE, message=message)
+            return render_template_string(HTML_TEMPLATE, message=message, csrf_token=session.get('csrf_token', ''))
 
         # Validate the key format
         if not re.fullmatch(r'^[a-fA-F0-9]{64}$', key):
             if is_api_request:
-                return jsonify({'error': 'invalid token format - accepts 64-character alphanumeric tokens'}), 400
-            message = "invalid token format - accepts 64-character alphanumeric tokens"
-            return render_template_string(HTML_TEMPLATE, message=message)
+                return jsonify({'error': 'invalid token format - expected 64 hexadecimal characters'}), 400
+            message = "invalid token format - expected 64 hexadecimal characters"
+            return render_template_string(HTML_TEMPLATE, message=message, csrf_token=session.get('csrf_token', ''))
 
+        conn = None
         try:
             key_hash = hashlib.sha256(key.encode()).hexdigest()
-            conn = sqlite3.connect(DB_FILE)
+            conn = sqlite3.connect(DB_FILE, timeout=5)
+            conn.execute('BEGIN IMMEDIATE')
 
             if action == 'add':
                 cursor = conn.execute("SELECT COUNT(*) FROM keys WHERE key_hash = ?", (key_hash,))
                 if cursor.fetchone()[0] > 0:
-                    conn.close()
                     if is_api_request:
                         return jsonify({'error': 'duplicate token hash detected - rejecting'}), 409
                     message = "duplicate token hash detected - rejecting"
-                    return render_template_string(HTML_TEMPLATE, message=message)
+                    return render_template_string(HTML_TEMPLATE, message=message, csrf_token=session.get('csrf_token', ''))
+
+                total = conn.execute('SELECT COUNT(*) FROM keys').fetchone()[0]
+                if total >= MAX_STORED_TOKENS:
+                    if is_api_request:
+                        return jsonify({'error': 'token capacity reached'}), 429
+                    return render_template_string(HTML_TEMPLATE, message='token capacity reached', csrf_token=session.get('csrf_token', '')), 429
 
                 encrypted_key = cipher.encrypt(key.encode())
                 conn.execute('INSERT INTO keys (encrypted_key, key_hash) VALUES (?, ?)', (encrypted_key, key_hash))
                 conn.commit()
-                conn.close()
                 if is_api_request:
                     return jsonify({'message': 'token added successfully'}), 201
                 message = "token added successfully"
-                return render_template_string(HTML_TEMPLATE, message=message)
+                return render_template_string(HTML_TEMPLATE, message=message, csrf_token=session.get('csrf_token', ''))
 
             elif action == 'remove':
                 cursor = conn.execute("SELECT COUNT(*) FROM keys WHERE key_hash = ?", (key_hash,))
                 if cursor.fetchone()[0] == 0:
-                    conn.close()
                     if is_api_request:
                         return jsonify({'error': 'token hash not found in database'}), 404
                     message = "token hash not found in database"
-                    return render_template_string(HTML_TEMPLATE, message=message)
+                    return render_template_string(HTML_TEMPLATE, message=message, csrf_token=session.get('csrf_token', ''))
 
                 conn.execute("DELETE FROM keys WHERE key_hash = ?", (key_hash,))
                 conn.commit()
-                conn.close()
                 if is_api_request:
                     return jsonify({'message': 'token removed successfully'}), 200
                 message = "token removed successfully"
-                return render_template_string(HTML_TEMPLATE, message=message)
+                return render_template_string(HTML_TEMPLATE, message=message, csrf_token=session.get('csrf_token', ''))
 
             else:
                 if is_api_request:
                     return jsonify({'error': 'invalid action'}), 400
                 message = "invalid action"
-                return render_template_string(HTML_TEMPLATE, message=message)
+                return render_template_string(HTML_TEMPLATE, message=message, csrf_token=session.get('csrf_token', ''))
 
-        except Exception as e:
-            print(f"Error managing key: {e}", flush=True)
+        except Exception as exc:
+            logging.error('token management operation failed (%s)', type(exc).__name__)
             if is_api_request:
-                return jsonify({'error': str(e)}), 500
-            message = f"an error occurred: {e}"
-            return render_template_string(HTML_TEMPLATE, message=message)
+                return jsonify({'error': 'operation failed'}), 500
+            message = "operation failed"
+            return render_template_string(HTML_TEMPLATE, message=message, csrf_token=session.get('csrf_token', '')), 500
+        finally:
+            if conn is not None:
+                conn.close()
 
     # Render HTML for GET requests
-    return render_template_string(HTML_TEMPLATE, message=message)
+    if request.method == 'GET':
+        session['csrf_token'] = secrets.token_urlsafe(32)
+        session.permanent = True
+    return render_template_string(HTML_TEMPLATE, message=message, csrf_token=session.get('csrf_token', ''))
 
 
 

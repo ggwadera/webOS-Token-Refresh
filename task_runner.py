@@ -1,127 +1,59 @@
+"""Refresh stored developer tokens with bounded, non-disclosing requests."""
+import logging
 import os
-import time
 import sqlite3
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+import time
+
 import requests
 from cryptography.fernet import Fernet
 
-# Base configuration
-base_url = "https://developer.lge.com/secure/ResetDevModeSession.dev?sessionToken="
-interval = int(os.getenv('SCRIPT_INTERVAL', 86400))  # Default to 24 hours if not set
-db_file = '/usr/src/app/db/keys.db'
-batch_size = 100  # Number of keys to process in each batch
+DB_FILE = os.getenv('DB_FILE', '/usr/src/app/db/keys.db')
+INTERVAL = max(300, int(os.getenv('SCRIPT_INTERVAL', '86400')))
+MAX_TOKENS = 1000
+CONCURRENCY = 4
+ENDPOINT = 'https://developer.lge.com/secure/ResetDevModeSession.dev'
 
-# Load encryption key
-encryption_key = os.getenv('ENCRYPTION_KEY')
-if not encryption_key:
-    raise RuntimeError("ENCRYPTION_KEY environment variable is not set.")
-cipher = Fernet(encryption_key.encode())
+def read_secret(name):
+    path = os.getenv(name + '_FILE')
+    value = open(path, encoding='ascii').read().strip() if path else os.getenv(name)
+    if not value:
+        raise RuntimeError(f'{name} is not configured')
+    return value
 
-# Initialize database connection
-def get_db_connection():
+cipher = Fernet(read_secret('ENCRYPTION_KEY').encode())
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+# HTTP libraries can include full URLs (and therefore query tokens) in diagnostics.
+logging.getLogger('urllib3').disabled = True
+logging.getLogger('requests').disabled = True
+
+def refresh_one(encrypted):
     try:
-        conn = sqlite3.connect(db_file)
-        return conn
-    except sqlite3.Error as e:
-        print(f"Database connection error: {e}", flush=True)
-        return None
+        token = cipher.decrypt(encrypted).decode('ascii')
+        # The LG API currently accepts the token only as a query parameter. Never
+        # log request URLs or exception text because both can contain that token.
+        response = requests.get(ENDPOINT, params={'sessionToken': token}, timeout=(5, 15),
+                                allow_redirects=False)
+        logging.info('LG refresh completed with HTTP %d', response.status_code)
+        response.close()
+    except (requests.RequestException, ValueError, UnicodeError):
+        logging.warning('LG refresh failed (details suppressed)')
+    except Exception:
+        logging.warning('Token refresh failed (details suppressed)')
 
-# Fetch a batch of encrypted keys from the database
-def fetch_encrypted_keys(offset, limit):
-    conn = get_db_connection()
-    if conn is None:
-        return []
+def refresh_cycle():
+    started = time.monotonic()
     try:
-        cursor = conn.cursor()
-        cursor.execute("SELECT encrypted_key FROM keys LIMIT ? OFFSET ?", (limit, offset))
-        rows = cursor.fetchall()
-        conn.close()
-        return [row[0] for row in rows]
-    except sqlite3.Error as e:
-        print(f"Error fetching keys: {e}", flush=True)
-        return []
+        with sqlite3.connect(f'file:{DB_FILE}?mode=ro', uri=True, timeout=5) as conn:
+            rows = conn.execute('SELECT encrypted_key FROM keys LIMIT ?', (MAX_TOKENS,)).fetchall()
+        # A small fixed worker pool avoids process forking and unbounded fan-out.
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
+            list(pool.map(refresh_one, (row[0] for row in rows)))
+        logging.info('Refresh cycle processed %d token(s)', len(rows))
+    except sqlite3.Error:
+        logging.error('Refresh cycle could not read token database')
+    return max(0, INTERVAL - (time.monotonic() - started))
 
-# Decrypt a single key
-def decrypt_key(encrypted_key):
-    try:
-        return cipher.decrypt(encrypted_key).decode()
-    except Exception as e:
-        print(f"Error decrypting key: {e}", flush=True)
-        return None
-
-# Send the request to the API using the token
-def send_request(token):
-    url = f"{base_url}{token}"
-    try:
-        response = requests.get(url)
-        masked_token = mask_token(token)
-        print(f"Request to {masked_token} returned status code {response.status_code}.", flush=True)
-    except requests.RequestException as e:
-        print(f"Failed to send request for token {mask_token(token)}: {e}", flush=True)
-
-# Masks the token for logs, showing only the last 4 characters
-def mask_token(token):
-    return f"***{token[-4:]}"
-
-# Decrypt keys in parallel
-def decrypt_keys_in_parallel(encrypted_keys):
-    with ProcessPoolExecutor() as decrypt_executor:
-        decrypted_keys = list(decrypt_executor.map(decrypt_key, encrypted_keys))
-    return [key for key in decrypted_keys if key is not None]
-
-# Send API requests in parallel
-def send_requests_in_parallel(decrypted_keys):
-    with ThreadPoolExecutor() as api_executor:
-        api_executor.map(send_request, decrypted_keys)
-
-# Process a batch of keys: decrypt in parallel and send API requests concurrently
-def process_keys_batch(encrypted_keys):
-    # Step 1: Parallel decryption
-    start_decrypt_time = time.time()
-    decrypted_keys = decrypt_keys_in_parallel(encrypted_keys)
-    end_decrypt_time = time.time()
-    decrypt_time = end_decrypt_time - start_decrypt_time
-    print(f"Decrypted {len(decrypted_keys)} keys in {decrypt_time:.2f} seconds.", flush=True)
-
-    # Step 2: Parallel API calls
-    start_api_time = time.time()
-    send_requests_in_parallel(decrypted_keys)
-    end_api_time = time.time()
-    api_time = end_api_time - start_api_time
-    print(f"Processed API calls for {len(decrypted_keys)} keys in {api_time:.2f} seconds.", flush=True)
-
-    return len(decrypted_keys), decrypt_time, api_time
-
-if __name__ == "__main__":
-    print("Starting task_runner...", flush=True)
+if __name__ == '__main__':
     while True:
-        offset = 0
-        total_processed = 0
-        total_decrypt_time = 0  # Track total decryption time
-        total_api_time = 0  # Track total API call time
-        batch_count = 0  # Track number of batches processed
-
-        while True:
-            encrypted_keys = fetch_encrypted_keys(offset, batch_size)
-            if not encrypted_keys:
-                break
-            processed_count, decrypt_time, api_time = process_keys_batch(encrypted_keys)
-            total_processed += processed_count
-            total_decrypt_time += decrypt_time
-            total_api_time += api_time
-            batch_count += 1
-            offset += batch_size
-
-        # Final summary after all batches are processed
-        total_elapsed_time = total_decrypt_time + total_api_time
-        new_lapse_interval = interval - total_elapsed_time
-        print("~~~~~~~~~~~~~~~~", flush=True)
-        print(f"Total number of keys processed: {total_processed}", flush=True)
-        print(f"Total number of batches processed: {batch_count}", flush=True)
-        print(f"Total elapsed decryption time: {total_decrypt_time:.2f} seconds.", flush=True)
-        print(f"Total elapsed API call time: {total_api_time:.2f} seconds.", flush=True)
-        print(f"Total elapsed time: {total_elapsed_time:.2f} seconds.", flush=True)
-        print(f"Sleeping for {new_lapse_interval:.2f} seconds.", flush=True)
-        print("~~~~~~~~~~~~~~~~", flush=True)
-
-        time.sleep(new_lapse_interval)
+        time.sleep(refresh_cycle())

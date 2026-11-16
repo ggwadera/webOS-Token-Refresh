@@ -3,6 +3,7 @@ import importlib
 import os
 from pathlib import Path
 import sqlite3
+from contextlib import closing
 import sys
 import tempfile
 import unittest
@@ -11,7 +12,12 @@ from unittest.mock import patch
 from cryptography.fernet import Fernet
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-with patch.dict(os.environ, {'ENCRYPTION_KEY': Fernet.generate_key().decode()}):
+_bootstrap_dir = tempfile.TemporaryDirectory()
+with patch.dict(os.environ, {
+    'ENCRYPTION_KEY': Fernet.generate_key().decode(),
+    'FLASK_SECRET': Fernet.generate_key().decode(),
+    'DB_FILE': str(Path(_bootstrap_dir.name) / 'bootstrap.db'),
+}):
     server = importlib.import_module('app')
 
 KEY = 'Ab' * 32
@@ -40,7 +46,7 @@ class KeyStatusTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json, {'registered': False})
         self.assertEqual(response.headers['Cache-Control'], 'no-store')
-        with sqlite3.connect(self.database) as conn:
+        with closing(sqlite3.connect(self.database)) as conn:
             self.assertEqual(conn.execute('SELECT COUNT(*) FROM keys').fetchone()[0], 0)
 
     def test_status_tracks_existing_add_duplicate_and_remove_contract(self):
@@ -75,12 +81,33 @@ class KeyStatusTests(unittest.TestCase):
         self.assertFalse(Path(server.DB_FILE).exists())
 
     def test_unavailable_schema_does_not_claim_the_hash_is_absent(self):
-        with sqlite3.connect(self.database) as conn:
+        with closing(sqlite3.connect(self.database)) as conn:
             conn.execute('DROP TABLE keys')
         self.assertEqual(self.status().status_code, 503)
 
     def test_hash_lookup_requires_post(self):
         self.assertEqual(self.client.get('/api/key-status').status_code, 405)
+
+    def test_browser_form_rejects_cross_site_post_without_csrf_token(self):
+        self.client.get('/', base_url='https://localhost')
+        response = self.client.post('/', data={'key': KEY, 'action': 'add'}, base_url='https://localhost')
+        self.assertEqual(response.status_code, 400)
+        with closing(sqlite3.connect(self.database)) as conn:
+            self.assertEqual(conn.execute('SELECT COUNT(*) FROM keys').fetchone()[0], 0)
+
+    def test_html_form_has_csrf_token_and_accepts_it(self):
+        page = self.client.get('/', base_url='https://localhost')
+        self.assertIn(b'name="csrf_token"', page.data)
+        with self.client.session_transaction(base_url='https://localhost') as session:
+            csrf = session['csrf_token']
+        response = self.client.post('/', data={'key': KEY, 'action': 'add', 'csrf_token': csrf}, base_url='https://localhost')
+        self.assertEqual(response.status_code, 200)
+
+    def test_management_error_does_not_return_exception_details(self):
+        server.DB_FILE = str(Path(self.directory.name) / 'missing-directory' / 'keys.db')
+        response = self.manage('add')
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json, {'error': 'operation failed'})
 
 
 if __name__ == '__main__':

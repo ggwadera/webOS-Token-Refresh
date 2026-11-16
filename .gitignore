@@ -1,2 +1,8 @@
+.env
+secrets/*
+!secrets/.gitignore
+backups/*
+!backups/.gitignore
+caddy-root.crt
 __pycache__/
 *.py[cod]

@@ -1,0 +1,21 @@
+{
+	auto_https disable_redirects
+}
+
+{$APP_HOST}:8443 {
+	bind 0.0.0.0
+	tls internal
+	route {
+		@outside not remote_ip {$LAN_CIDR}
+		respond @outside "Forbidden" 403
+		basic_auth {
+			{$CADDY_USER} {$CADDY_PASSWORD_HASH}
+		}
+		header {
+			Strict-Transport-Security "max-age=31536000"
+			X-Content-Type-Options "nosniff"
+			Referrer-Policy "no-referrer"
+		}
+		reverse_proxy app:5000
+	}
+}

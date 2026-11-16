@@ -1,40 +1,118 @@
+name: webos-token-refresh
 services:
-  web_app:
-    image: luciferscircle/webos-token-refresh:latest
-    container_name: web_app
-    networks:
-      - network_tunnel
-      - webOS
+  app:
+    build: {context: ., dockerfile: dockerfile}
+    image: webos-token-refresh:local
+    command: ["gunicorn", "--workers", "2", "--threads", "4", "--timeout", "30", "--graceful-timeout", "10", "--bind", "0.0.0.0:5000", "--error-logfile", "-", "app:app"]
     environment:
-      - ENCRYPTION_KEY= # Generate your own key
-      - APP_SCRIPT=app:app  # Specify the script to run, change to =app.py for test server w/logs
+      DB_FILE: /data/keys.db
+      ENCRYPTION_KEY_FILE: /run/secrets/encryption_key
+      FLASK_SECRET_FILE: /run/secrets/flask_secret
+    secrets: [encryption_key, flask_secret]
     volumes:
-      - type: bind
-        source: /path/to/db/dir # Add the directory you want to store keys.db inside
-        target: /usr/src/app/db
-    ports:
-      - "5000:5000"
-    restart: always
-
-  task_runner:
-    image: luciferscircle/webos-token-refresh:latest
-    container_name: task_runner
-    networks:
-      - webOS
-    environment:
-      - ENCRYPTION_KEY= # Repeat web_app key
-      - SCRIPT_INTERVAL=86400  # How often tokens will get refreshed. Default 24 hours
-      - APP_SCRIPT=task_runner.py # Start task runner, this can be on a seperate server. Dont change this one
-    volumes:
-      - type: bind
-        source: /path/to/db/dir # Repeat web_app source path
-        target: /usr/src/app/db
-    restart: always
+      - database:/data
+    networks: [frontend]
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=16m"]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    pids_limit: 64
+    mem_limit: 256m
+    cpus: 1.0
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
     depends_on:
-      - web_app
+      db-init: {condition: service_completed_successfully}
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+
+  worker:
+    build: {context: ., dockerfile: dockerfile}
+    image: webos-token-refresh:local
+    command: ["python", "task_runner.py"]
+    environment:
+      DB_FILE: /data/keys.db
+      ENCRYPTION_KEY_FILE: /run/secrets/encryption_key
+      SCRIPT_INTERVAL: ${SCRIPT_INTERVAL:-86400}
+    secrets: [encryption_key]
+    volumes:
+      - database:/data:ro
+    networks: [egress]
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=16m"]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    pids_limit: 32
+    mem_limit: 128m
+    cpus: 0.5
+    restart: unless-stopped
+    depends_on:
+      db-init: {condition: service_completed_successfully}
+      app: {condition: service_healthy}
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+
+  db-init:
+    build: {context: ., dockerfile: dockerfile}
+    image: webos-token-refresh:local
+    user: "0:0"
+    entrypoint: ["sh", "-c", "chown 10001:10001 /data"]
+    volumes: ["database:/data"]
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    cap_add: [CHOWN]
+    restart: "no"
+
+  proxy:
+    image: caddy:2.10.2-alpine
+    user: "0:0"
+    environment:
+      CADDY_USER: ${CADDY_USER:?set CADDY_USER in .env}
+      CADDY_PASSWORD_HASH: ${CADDY_PASSWORD_HASH:?set CADDY_PASSWORD_HASH in .env}
+      LAN_CIDR: ${LAN_CIDR:?set LAN_CIDR in .env}
+      LAN_BIND_IP: ${LAN_BIND_IP:?set LAN_BIND_IP in .env}
+      APP_HOST: ${APP_HOST:?set APP_HOST in .env}
+    ports:
+      - "${LAN_BIND_IP}:8443:8443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks: [frontend]
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=16m"]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    pids_limit: 64
+    mem_limit: 128m
+    restart: unless-stopped
+    depends_on:
+      app: {condition: service_healthy}
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
 
 networks:
-  network_tunnel:
-    external: true
-  webOS:
-    external: true
+  frontend:
+    internal: true
+  egress:
+
+volumes:
+  database:
+    name: webos-token-refresh-database
+  caddy_data:
+  caddy_config:
+
+secrets:
+  encryption_key:
+    file: ./secrets/encryption_key
+  flask_secret:
+    file: ./secrets/flask_secret
